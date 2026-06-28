@@ -1,0 +1,467 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{parskip}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  backgroundcolor=\color{gray!8},
+  frame=single,
+  framerule=0.4pt,
+  language=Python,
+  breaklines=true,
+  showstringspaces=false,
+}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+\title{\textbf{Project 7: Stream Analysis}\\[4pt]
+       \large Algorithms for Massive Datasets\\
+       Master in Computer Science - Università degli Studi di Milano, 2025/26}
+\author{Gian Marco Bratzu}
+\date{June 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report describes the implementation of three streaming algorithms applied to the
+\textit{New York Times Articles \& Comments 2020} dataset.
+The comment log is interpreted as a time-ordered stream, and three algorithms are
+implemented from scratch: \textbf{Flajolet-Martin} (count of distinct users),
+\textbf{Alon-Matias-Szegedy} (second moment of the section distribution), and a
+\textbf{Bloom filter} (set-membership test for articles belonging to a given section).
+Each estimator is compared against the computed exact value to measure the
+approximation error. All three work in a single pass and use memory independent of
+the stream length.
+The full code is available at:
+\url{https://github.com/Bratzu93/Algorithms-for-massive-datasets}.
+\end{abstract}
+
+\section{Introduction}
+
+Streaming algorithms address the scenario in which data arrives as a continuous sequence
+of elements that can be processed only once, without the ability to store the entire stream.
+The fundamental constraints are one-pass processing and sublinear (ideally constant)
+memory usage. In exchange, only approximate answers are provided, with provable
+probabilistic guarantees.
+
+This project applies three classical streaming techniques to user comments from
+The New York Times, treating the sequence of comments, ordered by publication
+timestamp as the stream.
+The three problems addressed are:
+\begin{enumerate}
+  \item Counting \textbf{distinct users} (Flajolet-Martin), specifically the
+        0\textsuperscript{th} frequency moment $F_0$.
+  \item Estimating the \textbf{second moment} of the comment distribution across
+        sections (Alon-Matias-Szegedy): how much does traffic concentrate on a few sections?
+  \item \textbf{Bloom filter} for set membership: given an article ID, is it in Opinion?
+\end{enumerate}
+
+\section{Dataset}
+
+\subsection*{Source}
+New York Times Articles \& Comments (2020), Kaggle, identifier
+\texttt{benjaminawd/new-york-times-articles-comments-2020} (CC BY-NC-SA 4.0, accessed June 2026)~\cite{kaggle}.
+
+\subsection*{Files}
+\begin{itemize}
+  \item \texttt{nyt-articles-2020.csv}: 16,787 articles with fields including
+        \texttt{uniqueID}, \texttt{section}, \texttt{headline}, \texttt{pub\_date}.
+        The 42 distinct sections include U.S.\ (2,364 articles), Opinion (2,272),
+        World (1,183), Arts (1,094), and New York (1,055).
+  \item \texttt{nyt-comments-part0.csv}: first partition of the comments,
+        approximately 300~MB and 500,000 rows. Used for the subsampled run.
+  \item \texttt{nyt-comments-2020.csv}: single pre-merged file of approximately
+        3~GB containing \textbf{4,986,461 comments} in total. Used for the full-scale run.
+        Relevant fields (both files): \texttt{userID} (integer), \texttt{createDate} (timestamp),
+        \texttt{articleID} (URI string).
+\end{itemize}
+
+\subsection*{Download}
+The dataset is downloaded via the Kaggle CLI at notebook startup.
+On Google Colab the credentials (\texttt{KAGGLE\_USERNAME}, \texttt{KAGGLE\_KEY})
+are read from Colab Secrets; locally from \texttt{\textasciitilde/.kaggle/kaggle.json}.
+The dataset is not committed to the repository.
+
+\section{Data Organisation and Pre-processing}
+
+\subsection*{Stream construction}
+The stream is the sequence of comments sorted in ascending order by \texttt{createDate}, since the timestamp format is \texttt{YYYY-MM-DD HH:MM:SS}.
+
+\subsection*{Section enrichment}
+The comments file does not carry section information; it is added via a pandas
+left join on the articles file, matching \texttt{comments.articleID} to
+\texttt{articles.uniqueID}.
+The articles file is loaded with only the two columns needed (\texttt{uniqueID},
+\texttt{section}) and merged into the comments DataFrame in a single pass;
+\texttt{uniqueID} is then dropped, leaving a \texttt{section} column alongside
+each comment.
+Manual inspection confirmed that every comment matches an article in the articles
+file, so no \texttt{NaN} values appear in the \texttt{section} column after the join.
+
+\subsection*{Subsampling}
+A global boolean variable \texttt{SUBSAMPLE} controls data size at runtime.
+\begin{itemize}
+  \item \texttt{SUBSAMPLE = True} (default): loads \texttt{nyt-comments-part0.csv},
+        sorts by timestamp, and retains the first 200,000 comments. This setting
+        is designed for Google Colab and completes
+        in a few minutes.
+  \item \texttt{SUBSAMPLE = False}: loads \texttt{nyt-comments-2020.csv} directly and
+        sorts the full 4,986,461-comment stream. Intended for local execution.
+\end{itemize}
+
+\subsection*{Stream simulation}
+The stream is simulated by sorting the DataFrame by \texttt{createDate} and
+iterating over the elements with a \texttt{for} loop, passing one item at a time
+to each algorithm's \texttt{update} method, mirroring how a real stream would
+trigger updates on arrival.
+The full dataset is held in memory as input, but the streaming constraint applies
+to the \emph{algorithm state}: FM stores $H$ integers and AMS stores $k$ counters,
+both independent of the stream length.
+The Bloom filter stores $m$ bits, where $m$ is computed from the number of elements
+to insert $n$ and the target FPR; its memory therefore grows with the positive set
+size, not with the stream length.
+One acknowledged limitation is that AMS requires knowing $n$ before the stream
+begins in order to sample positions uniformly; in a truly online setting this
+would require a preliminary counting pass.
+
+\section{Algorithms and Implementations}
+
+\subsection{Flajolet-Martin (Distinct Elements)}
+
+The goal is to estimate $F_0 = |\{x : f_x > 0\}|$, the number of distinct
+\texttt{userID} values, in a single pass over the stream.
+
+\subsubsection*{Algorithm}
+For a hash function $h$ that maps elements uniformly over $\{0,1\}^b$, the probability
+that $h(x)$ ends in at least $k$ trailing zero bits is $2^{-k}$. Consequently, if $R$
+is the maximum number of trailing zeros observed across all elements in the stream,
+then $\hat{F}_0 = 2^R$ is an estimate of $F_0$.
+
+To reduce variance, $H$ independent hash functions are used.
+Their $R_{\max}$ values are divided into $G$ groups; within each group the median is
+taken (to suppress outliers arising from $h(x)=0$, which would give an infinite tail
+length), and the final estimate is the mean of the per-group estimates:
+\[
+  \hat{F}_0 = \frac{1}{G}\sum_{g=1}^{G} 2^{\,\mathrm{median}(R^{(g)})}
+\]
+
+\subsubsection*{Initial approach: MD5 with sequential salts}
+
+A first implementation derived $H$ hash functions from MD5 by varying a numeric salt:
+\[
+  h_i(x) = \mathrm{MD5}\!\left(\texttt{str}(x) + \texttt{"\_"} + \texttt{str}(\mathrm{seed}+i)\right)
+  \bmod 2^{128}, \qquad i = 0, 1, \ldots, H-1
+\]
+The trailing zero count was read by converting the integer output to its binary
+string representation and iterating over characters from the right.
+This approach was replaced for two reasons.
+First, \textbf{performance}: the MD5 version required approximately 30 seconds on
+the subsample and 20 minutes on the full dataset, versus 3 seconds and 4 minutes
+respectively for the universal hash implementation — a roughly 5--10$\times$ slowdown
+attributable to string conversion and the character-by-character trailing-zero loop.
+Second, \textbf{implementation}: the bit-trick \texttt{(h \& -h).bit\_length() - 1}
+computes the trailing-zero count in $O(1)$ without any string parsing, and
+hash functions of the form $(ax+b) \bmod p$ provide stronger theoretical
+independence guarantees than MD5 with sequential salts.
+
+\subsubsection*{Final implementation: universal hashing}
+Each hash function is a member of the 2-universal family:
+\[
+  h_i(x) = (a_i \cdot x + b_i) \bmod p, \qquad
+  p = 2^{61}-1 \text{ (Mersenne prime)}
+\]
+with $a_i \in [1, p-1]$ and $b_i \in [0, p-1]$ chosen independently at random.
+Coefficients sampled from a space of $\sim 2^{61}$ values ensure statistical
+independence across the $H$ hash functions, enabling genuine variance reduction.
+
+\subsubsection*{Trailing zeros}
+The number of trailing zero bits of $h$ is computed with the identity:
+\begin{lstlisting}
+(h & -h).bit_length() - 1
+\end{lstlisting}
+The expression \texttt{h \& -h} isolates the least significant set bit
+(e.g.\ $12_{10} = 1100_2 \;\to\; 0100_2 = 4$); \texttt{bit\_length() - 1} gives its
+position, which equals the trailing-zero count. I used \texttt{FM\_NUM\_HASHES = 64}
+and \texttt{FM\_NUM\_GROUPS = 8}.
+
+\subsubsection*{Results}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{r rr rr}
+\toprule
+& \multicolumn{2}{c}{MD5} & \multicolumn{2}{c}{Universal hash} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+$H$ & Estimate & Error & Estimate & Error \\
+\midrule
+  8 &  55\,296 &   8.7\% & 266\,240 & 423.3\% \\
+ 16 &  53\,745 &   5.6\% &  69\,426 &  36.5\% \\
+ 32 &  45\,347 &  10.9\% &  96\,281 &  89.2\% \\
+ 64 &  61\,028 &  20.0\% &  53\,042 &   4.3\% \\
+128 &  54\,945 &   8.0\% &  48\,449 &   4.8\% \\
+256 &  56\,144 &  10.4\% &  59\,041 &  16.0\% \\
+512 &  57\,344 &  12.7\% &  63\,137 &  24.1\% \\
+\bottomrule
+\end{tabular}
+\caption{FM on the subsample (200,000 comments, $G=8$ groups, \texttt{SEED=1},
+  exact $F_0^* = 50{,}876$). Run time for $H=256$--$512$: MD5 2m\,40s, universal hash 33s.}
+\label{tab:fm_subsample}
+\end{table}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{r rr rr}
+\toprule
+& \multicolumn{2}{c}{MD5} & \multicolumn{2}{c}{Universal hash} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+$H$ & Estimate & Error & Estimate & Error \\
+\midrule
+  8 & 1\,933\,312 & 379.7\% & 663\,552 &  64.6\% \\
+ 16 &   992\,155 & 146.2\% & 534\,568 &  32.6\% \\
+ 32 &   409\,118 &   1.5\% & 465\,056 &  15.4\% \\
+ 64 &   501\,800 &  24.5\% & 540\,190 &  34.0\% \\
+128 &   499\,471 &  23.9\% & 374\,021 &   7.2\% \\
+\bottomrule
+\end{tabular}
+\caption{FM on the full dataset (4,986,461 comments, $G=8$ groups, \texttt{SEED=1},
+  exact $F_0^* = 403{,}025$). Run time: MD5 20m\,10s, universal hash 4m\,20s.}
+\label{tab:fm}
+\end{table}
+
+Universal hashing is approximately $5\times$ faster than MD5 in both settings.
+
+This illustrates a key limitation of single-run evaluation: a single extreme
+$R_{\max}$ value can shift a group median regardless of how many hash functions
+are used, making the error non-monotone in $H$.
+The formula gives the expected error over many independent runs, not a per-run guarantee.
+
+The number of groups $G$ controls the confidence level: a larger $G$ reduces the
+probability that all group medians are simultaneously wrong.
+For robust estimates, averaging multiple independent runs (each with a different seed)
+is more reliable than relying on a single run with a large $H$.
+
+\subsection{Alon-Matias-Szegedy (Second Moment)}
+
+The second frequency moment $F_2 = \sum_{j} m_j^2$ (where $m_j$ is the number of
+comments in section $j$) measures how concentrated the distribution is across sections:
+the more uneven, the higher $F_2$.
+
+\subsubsection*{Algorithm}
+Assume the stream length $n$ is known in advance. Sample $k$ positions
+$p_1, \ldots, p_k$ uniformly at random from $[0, n)$.
+For each sampled position $p_i$, maintain a variable $X_i$:
+\begin{enumerate}
+  \item When the stream reaches position $p_i$: record $\mathrm{elem}_i \leftarrow \mathrm{stream}[p_i]$ and set $v_i \leftarrow 1$.
+  \item For each subsequent position $j > p_i$: if $\mathrm{stream}[j] = \mathrm{elem}_i$, increment $v_i$.
+\end{enumerate}
+The estimator for $F_2$ is:
+\[
+  \hat{F}_2 = \frac{1}{k}\sum_{i=1}^{k} n\cdot(2v_i - 1)
+\]
+It can be shown that $\mathbb{E}[n(2v_i-1)] = F_2$, so the average over all $k$
+variables gives an unbiased estimate. The intuition is that frequent elements are
+more likely to be sampled and to reappear afterwards, contributing proportionally to $m_j^2$.
+
+\subsubsection*{Implementation detail}
+The $k$ sampled positions are stored in sorted order, so the update loop can break
+early as soon as it encounters a position beyond the current stream index.
+
+On average only half the variables are active at any point in the stream, so the
+expected number of iterations per update call is $k/2$. I used \texttt{AMS\_NUM\_VARS = 100}.
+
+\subsubsection*{Results}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{rrr}
+\toprule
+$k$ (variables) & Estimate & Relative error \\
+\midrule
+ 10 & 9,246,760,000 & 4.3\% \\
+ 25 & 9,891,080,000 & 2.3\% \\
+ 50 & 9,677,872,000 & 0.1\% \\
+100 & 9,214,792,000 & 4.7\% \\
+200 & 9,716,568,000 & 0.5\% \\
+\bottomrule
+\end{tabular}
+\caption{AMS on the subsample (200,000 comments, \texttt{SEED=1}, exact $F_2^* = 9{,}667{,}184{,}406$).}
+\label{tab:ams_subsample}
+\end{table}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{rrr}
+\toprule
+$k$ (variables) & Estimate & Relative error \\
+\midrule
+ 10 & 4,094,686,303,929 & 30.8\% \\
+ 25 & 5,649,804,521,452 &  4.5\% \\
+ 50 & 6,104,101,436,235 &  3.2\% \\
+100 & 5,234,470,416,714 & 11.5\% \\
+200 & 5,269,086,030,059 & 10.9\% \\
+\bottomrule
+\end{tabular}
+\caption{AMS on the full dataset (4,986,461 comments, \texttt{SEED=1}, exact $F_2^* = 5{,}916{,}853{,}781{,}669$).}
+\label{tab:ams}
+\end{table}
+
+The estimator is non-monotone in $k$ for a single run, consistent with its
+theoretical variance of $O(F_2^2/k)$.
+On the subsample errors stay below 5\% for all $k$; on the full dataset errors
+reach 10--30\% even at large $k$, reflecting the higher $F_2$ and wider variance
+of the larger stream.
+
+\subsection{Bloom Filter (Set Membership)}
+
+Given the set $S$ of Opinion article IDs, the goal is to answer membership queries
+``is article $x \in S$?'' in $O(1)$ time, tolerating a small rate of false positives.
+
+\subsubsection*{Data structure}
+A Bloom filter consists of a bit array of $m$ bits (initially all zero) and $k$
+independent hash functions $h_1, \ldots, h_k : U \to [0, m)$.
+\begin{itemize}
+  \item \textbf{Insertion of $x$}: set bits $h_1(x), \ldots, h_k(x)$ to 1.
+  \item \textbf{Query for $x$}: return \textsc{true} iff all $k$ bits are set.
+\end{itemize}
+False negatives are impossible; false positives occur when all $k$ hash positions of
+a non-member element happen to be set by other insertions.
+The theoretical false positive rate (FPR) for $n$ inserted elements is:
+\[
+  \mathrm{FPR}(m,k,n) = \left(1 - e^{-kn/m}\right)^k
+\]
+The optimal number of hash functions for a given $m/n$ ratio is
+$k^* = (m/n)\ln 2$.
+
+\subsubsection*{Bit-array size}
+The number of hash functions is fixed at \texttt{BF\_K\_HASHES} $= k = 7$.
+This value is an upper bound on $k^*$ for all targets tested with the full dataset
+($n = 2{,}272$): the most stringent target of $p = 1\%$ gives
+$k^* \approx 6.65$, and larger targets give smaller $k^*$.
+
+Rather than fixing $m$ as a global constant, the filter computes it automatically
+from $n$, $k$, and a target FPR $p$ by solving $\mathrm{FPR}(m,k,n) = p$
+for $m$ with $k$ fixed:
+\[
+  m = \left\lceil \frac{-k\, n}{\ln\!\left(1 - p^{1/k}\right)} \right\rceil
+\]
+The default target is \texttt{BF\_TARGET\_FPR = 0.01} (1\%), giving
+$m \approx 21{,}796$ bits for the 2,272 full-dataset Opinion articles.
+
+\subsubsection*{Hash functions}
+Each of the $k$ hash functions is implemented as:
+\[
+  h_i(x) = \mathrm{MD5}(x \,\|\, \mathrm{salt}_i) \bmod m
+\]
+where $\mathrm{salt}_i$ is a distinct random 32-bit integer string generated at
+construction time; MD5 works well here since article IDs are URI strings.
+
+\subsubsection*{Results}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{rrrr}
+\toprule
+Target FPR & $m$ (bits) & FPR empirical & FPR theoretical \\
+\midrule
+50\% &  6,735 & 50.40\% & 50.00\% \\
+20\% & 10,049 & 19.44\% & 19.99\% \\
+10\% & 12,505 &  9.67\% & 10.00\% \\
+ 5\% & 15,074 &  4.99\% &  5.00\% \\
+ 1\% & 21,796 &  1.01\% &  1.00\% \\
+\bottomrule
+\end{tabular}
+\caption{Bloom filter on the full dataset ($n=2{,}272$ Opinion articles, $k=7$,
+  14,515 negative queries, \texttt{SEED=1}).}
+\label{tab:bloom}
+\end{table}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{rrrr}
+\toprule
+Target FPR & $m$ (bits) & FPR empirical & FPR theoretical \\
+\midrule
+50\% &   338 & 60.18\% & 49.98\% \\
+20\% &   505 & 19.30\% & 19.91\% \\
+10\% &   628 &  9.65\% &  9.97\% \\
+ 5\% &   757 &  4.91\% &  4.98\% \\
+ 1\% & 1,094 &  0.70\% &  1.00\% \\
+\bottomrule
+\end{tabular}
+\caption{Bloom filter on the subsample ($n=114$ Opinion articles, $k=7$,
+  570 negative queries, \texttt{SEED=1}).}
+\label{tab:bloom_subsample}
+\end{table}
+
+The theoretical FPR matches the target across all settings.
+On the full dataset the empirical FPR tracks the target closely for all values of
+$p$; on the subsample the 50\% target shows a larger deviation (60\% vs.\ 50\%)
+due to the high variance of the observed proportion when both $n$ (114 inserted
+elements) and the number of negative queries (570) are small.
+
+\section{Scalability}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{llll}
+\toprule
+Algorithm & Memory (algorithm state) & Time per element  \\
+\midrule
+Flajolet-Martin  & $O(H)$ & $O(H)$ \\
+AMS              & $O(k)$ & $O(k)$ \\
+Bloom filter     & $O(m)$ & $O(k_{\mathrm{BF}})$ \\
+\bottomrule
+\end{tabular}
+\caption{Complexity of the three algorithms. $H$ = number of hash functions (FM),
+$k$ = number of AMS variables, $m$ = number of Bloom filter bits,
+$k_{\mathrm{BF}}$ = number of Bloom filter hash functions. }
+\label{tab:scalability}
+\end{table}
+
+The memory used by the algorithm \emph{state} is constant with respect to the stream
+length $n$: FM stores $H = 64$ integers, AMS stores $k = 100$ counters and element
+labels, and the Bloom filter stores an $m$-bit array where $m$ is determined by $n$
+and the target FPR (e.g.\ $m \approx 21{,}796$ bits $\approx$2.7~KB for $n=2{,}272$
+and target 1\%).
+
+
+\begin{thebibliography}{9}
+
+\bibitem{mmds}
+J.~Leskovec, A.~Rajaraman, and J.~D.~Ullman,
+\textit{Mining of Massive Datasets}, 3rd ed.,
+Cambridge University Press, 2020.
+\url{http://www.mmds.org/}
+
+\bibitem{kaggle}
+B.~Awad,
+\textit{New York Times Articles \& Comments (2020)},
+Kaggle, 2020.
+\url{https://www.kaggle.com/datasets/benjaminawd/new-york-times-articles-comments-2020}
+
+\end{thebibliography}
+
+\section*{Declaration}
+
+I declare that this material, which I now submit for assessment, is entirely my own
+work and has not been taken from the work of others, save and to the extent that such
+work has been cited and acknowledged within the text of my work. I understand that
+plagiarism, collusion, and copying are grave and serious offences in the university
+and accept the penalties that would be imposed should I engage in plagiarism,
+collusion or copying. This assignment, or any part of it, has not been previously
+submitted by me or any other person for assessment on this or any other course of
+study. No generative AI tool has been used to write the code or the report content.
+
+\end{document}
